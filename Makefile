@@ -1,8 +1,11 @@
-main: main.cpp
-	mpicxx -o main main.cpp -std=c++20
+bin = bin
 
-run: main
-	mpirun -n 4 ./main
+$(bin)/main: main.cpp
+	mkdir -p $(bin)
+	mpicxx -o $(bin)/main main.cpp -std=c++20
+
+run: $(bin)/main
+	mpirun -n 4 ./$(bin)/main
 
 clean:
-	rm -f main
+	rm -fr $(bin)
