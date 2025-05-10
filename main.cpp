@@ -141,7 +141,7 @@ void gather_grid(const Grid& global, Grid& subdom)
     MPI_Gatherv(subdom[1].data(), recvcounts[rank], MPI_INT, (int*)global.data(), recvcounts.data(), displs.data(), MPI_INT, 0, MPI_COMM_WORLD);
 }
 
-void sync_borders(Grid& subdom)
+void sync_borders(Grid& subdom, MPI_Datatype row_t)
 {
     int rank = -1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -155,13 +155,13 @@ void sync_borders(Grid& subdom)
     MPI_Request reqs[4];
     MPI_Status stats[4];
 
-    MPI_Isend(subdom[1].data(), subdom[1].size(), MPI_INT, prev, 0, MPI_COMM_WORLD, &reqs[0]);
-    MPI_Irecv((int*)subdom[0].data(), subdom[0].size(), MPI_INT, prev, 1, MPI_COMM_WORLD, &reqs[1]);
+    MPI_Isend(subdom[1].data(), 1, row_t, prev, 0, MPI_COMM_WORLD, &reqs[0]);
+    MPI_Irecv((int*)subdom[0].data(), 1, row_t, prev, 1, MPI_COMM_WORLD, &reqs[1]);
 
     int rows = subdom.rows() - 2;
 
-    MPI_Isend(subdom[rows].data(), subdom[rows].size(), MPI_INT, next, 1, MPI_COMM_WORLD, &reqs[2]);
-    MPI_Irecv((int*)subdom[rows + 1].data(), subdom[rows + 1].size(), MPI_INT, next, 0, MPI_COMM_WORLD, &reqs[3]);
+    MPI_Isend(subdom[rows].data(), 1, row_t, next, 1, MPI_COMM_WORLD, &reqs[2]);
+    MPI_Irecv((int*)subdom[rows + 1].data(), 1, row_t, next, 0, MPI_COMM_WORLD, &reqs[3]);
 
     MPI_Waitall(4, reqs, stats);
 }
@@ -238,7 +238,12 @@ int main(int argc, char **argv)
 
     scatter_grid(global, subdom);
 
-    sync_borders(subdom);
+    MPI_Datatype row_t;
+
+    MPI_Type_contiguous(subdom_width, MPI_INT, &row_t);
+    MPI_Type_commit(&row_t);
+    
+    sync_borders(subdom, row_t);
     test_stop(subdom); // save gen 0 position
 
     // print_grid(subdom);
@@ -253,19 +258,19 @@ int main(int argc, char **argv)
             {
                 int prev_j = j == 0 ? subdom.cols() - 1 : j - 1;
                 int next_j = j == subdom.cols() - 1 ? 0 : j + 1;
-
+                
                 int neighbors_count =
-                    subdom[i - 1][prev_j] + subdom[i - 1][j] + subdom[i - 1][next_j] +
+                subdom[i - 1][prev_j] + subdom[i - 1][j] + subdom[i - 1][next_j] +
                     subdom[i]    [prev_j] + subdom[i][next_j] +
                     subdom[i + 1][prev_j] + subdom[i + 1][j] + subdom[i + 1][next_j];
                 
-                new_subdom[i][j] = (neighbors_count == 3) || 
-                                   (subdom[i][j] && neighbors_count == 2);
-            }
+                    new_subdom[i][j] = (neighbors_count == 3) || 
+                    (subdom[i][j] && neighbors_count == 2);
+                }
         }
 
         subdom = std::move(new_subdom);
-        sync_borders(subdom);
+        sync_borders(subdom, row_t);
 
         if (test_stop(subdom))
         {
@@ -287,7 +292,8 @@ int main(int argc, char **argv)
 
         print_grid(global);
     }
-
+    
+    MPI_Type_free(&row_t);
     MPI_Finalize();
     return 0;
 }
