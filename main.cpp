@@ -99,12 +99,19 @@ void print_grid(const Grid& grid)
 
 void scatter_grid(const Grid& global, Grid& subdom, MPI_Datatype block_t, MPI_Datatype displaced_block_t)
 {
-    MPI_Scatter(global.data(), 1, block_t, &subdom[0][1], 1, displaced_block_t, 0, MPI_COMM_WORLD);
+    // long lb = -1;
+    // long extent = -1;
+
+    // MPI_Type_get_extent(displaced_block_t, &lb, &extent);
+    // std::cout << "lb = " << lb << '\n';
+    // std::cout << "extent = " << extent << '\n';
+
+    MPI_Scatter(global.data(), 1, block_t, subdom.data() + 1, 1, displaced_block_t, 0, MPI_COMM_WORLD);
 }
 
 void gather_grid(Grid& global, const Grid& subdom, MPI_Datatype block_t, MPI_Datatype displaced_block_t)
 {
-    MPI_Gather(&subdom[0][1], 1, displaced_block_t, global.data(), 1, block_t, 0, MPI_COMM_WORLD);
+    MPI_Gather(subdom.data() + 1, 1, displaced_block_t, global.data(), 1, block_t, 0, MPI_COMM_WORLD);
 }
 
 void sync_borders(Grid& subdom, MPI_Datatype col_t)
@@ -206,7 +213,6 @@ int main(int argc, char **argv)
     MPI_Datatype block_t;
     {
         MPI_Datatype full_size_block_t;
-
         MPI_Type_vector(subdom_height, subdom_width, kGlobalWidth, MPI_INT, &full_size_block_t);
         MPI_Type_commit(&full_size_block_t);
         
@@ -217,8 +223,23 @@ int main(int argc, char **argv)
     }
 
     MPI_Datatype displaced_block_t;
-    MPI_Type_vector(subdom_height, subdom_width, subdom_width + 2, MPI_INT, &displaced_block_t);
-    MPI_Type_commit(&displaced_block_t);
+    {
+        MPI_Datatype inner_block_t;
+        MPI_Type_vector(subdom_height, subdom_width, subdom_width + 2, MPI_INT, &inner_block_t);
+        MPI_Type_commit(&inner_block_t);
+
+        long lb = -1;
+        long extent = -1;
+
+        MPI_Type_get_extent(inner_block_t, &lb, &extent);
+        // std::cout << lb << '\n';
+        // std::cout << extent << '\n';
+
+        MPI_Type_create_resized(inner_block_t, lb + sizeof(int), extent, &displaced_block_t); // doesn't work with scatter WTF
+        MPI_Type_commit(&displaced_block_t);
+
+        MPI_Type_free(&inner_block_t);
+    }
     
     Grid subdom(subdom_height, subdom_width + 2);
     Grid global;
@@ -239,6 +260,7 @@ int main(int argc, char **argv)
     test_stop(subdom); // save gen 0 position
 
     // print_grid(subdom);
+    // return 0;
 
     int gen = 0;
     for (; gen < kMaxGenerations; ++gen)
