@@ -7,8 +7,8 @@
 #include <vector>
 #include <unordered_set>
 
-const int kGlobalWidth = 9;
-const int kGlobalHeight = 9;
+const int kGlobalWidth = 8;
+const int kGlobalHeight = 8;
 const int kMaxGenerations = 40;
 
 enum Side
@@ -97,51 +97,17 @@ void print_grid(const Grid& grid)
     std::cout << ss.str() << std::endl;
 }
 
-std::pair<std::vector<int>, std::vector<int>> GetDisplacementsAndRecvCounts(int size)
+void scatter_grid(const Grid& global, Grid& subdom, MPI_Datatype block_t, MPI_Datatype displaced_block_t)
 {
-    std::vector<int> recvcounts(size, kGlobalWidth * (kGlobalHeight / size));
-    recvcounts.back() = kGlobalWidth * (kGlobalHeight / size + kGlobalHeight % size);
-
-    std::vector<int> displs(size, 0);
-    for (int i = 1; i < size; ++i)
-    {
-        displs[i] = displs[i - 1] + recvcounts[i - 1];
-    }
-
-    return { std::move(displs), std::move(recvcounts) };
+    MPI_Scatter(global.data(), 1, block_t, &subdom[0][1], 1, displaced_block_t, 0, MPI_COMM_WORLD);
 }
 
-void scatter_grid(const Grid& global, Grid& subdom)
+void gather_grid(Grid& global, const Grid& subdom, MPI_Datatype block_t, MPI_Datatype displaced_block_t)
 {
-    int rank = -1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    
-    int size = -1;
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    const auto& [displs, recvcounts] = GetDisplacementsAndRecvCounts(size);
-
-    assert(rank != 0 || global.size() == recvcounts.back() + displs.back());
-
-    MPI_Scatterv(global.data(), recvcounts.data(), displs.data(), MPI_INT, (int*)subdom[1].data(), recvcounts[rank], MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&subdom[0][1], 1, displaced_block_t, global.data(), 1, block_t, 0, MPI_COMM_WORLD);
 }
 
-void gather_grid(const Grid& global, Grid& subdom)
-{
-    int rank = -1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    
-    int size = -1;
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
-    const auto& [displs, recvcounts] = GetDisplacementsAndRecvCounts(size);
-    
-    assert(rank != 0 || global.size() == recvcounts.back() + displs.back());
-
-    MPI_Gatherv(subdom[1].data(), recvcounts[rank], MPI_INT, (int*)global.data(), recvcounts.data(), displs.data(), MPI_INT, 0, MPI_COMM_WORLD);
-}
-
-void sync_borders(Grid& subdom, MPI_Datatype row_t)
+void sync_borders(Grid& subdom, MPI_Datatype col_t)
 {
     int rank = -1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -155,13 +121,13 @@ void sync_borders(Grid& subdom, MPI_Datatype row_t)
     MPI_Request reqs[4];
     MPI_Status stats[4];
 
-    MPI_Isend(subdom[1].data(), 1, row_t, prev, 0, MPI_COMM_WORLD, &reqs[0]);
-    MPI_Irecv((int*)subdom[0].data(), 1, row_t, prev, 1, MPI_COMM_WORLD, &reqs[1]);
+    MPI_Isend(&subdom[0][1], 1, col_t, prev, 0, MPI_COMM_WORLD, &reqs[0]);
+    MPI_Irecv(&subdom[0][0], 1, col_t, prev, 1, MPI_COMM_WORLD, &reqs[1]);
 
-    int rows = subdom.rows() - 2;
+    int cols = subdom.cols() - 2;
 
-    MPI_Isend(subdom[rows].data(), 1, row_t, next, 1, MPI_COMM_WORLD, &reqs[2]);
-    MPI_Irecv((int*)subdom[rows + 1].data(), 1, row_t, next, 0, MPI_COMM_WORLD, &reqs[3]);
+    MPI_Isend(&subdom[0][cols], 1, col_t, next, 1, MPI_COMM_WORLD, &reqs[2]);
+    MPI_Irecv(&subdom[0][cols + 1], 1, col_t, next, 0, MPI_COMM_WORLD, &reqs[3]);
 
     MPI_Waitall(4, reqs, stats);
 }
@@ -197,16 +163,27 @@ bool test_stop(const Grid& subdom)
     return std::find(new_subdoms.begin(), new_subdoms.end(), 1) == new_subdoms.end(); // find new subdom
 }
 
-int get_subdom_height(int rank, int size)
+int divide_for_rank(int val, int rank, int size)
 {
     if (rank != size - 1)
     {
-        return kGlobalHeight / size;
+        return val / size;
     }
     else
     {
-        return kGlobalHeight / size + kGlobalHeight % size;
+        return val / size + val % size;
     }
+
+}
+
+int get_subdom_height(int rank, int size)
+{
+    return divide_for_rank(kGlobalHeight, rank, size);
+}
+
+int get_subdom_width(int rank, int size)
+{
+    return divide_for_rank(kGlobalWidth, rank, size);
 }
 
 int main(int argc, char **argv)
@@ -219,10 +196,31 @@ int main(int argc, char **argv)
     int size = -1;
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
-    int subdom_width = kGlobalWidth;
-    int subdom_height = get_subdom_height(rank, size);
+    int subdom_width = get_subdom_width(rank, size);
+    int subdom_height = kGlobalHeight;
+
+    MPI_Datatype col_t;
+    MPI_Type_vector(subdom_height, 1, subdom_width + 2, MPI_INT, &col_t);
+    MPI_Type_commit(&col_t);
     
-    Grid subdom(subdom_height + 2, subdom_width);
+    MPI_Datatype block_t;
+    {
+        MPI_Datatype full_size_block_t;
+
+        MPI_Type_vector(subdom_height, subdom_width, kGlobalWidth, MPI_INT, &full_size_block_t);
+        MPI_Type_commit(&full_size_block_t);
+        
+        MPI_Type_create_resized(full_size_block_t, 0, subdom_width * sizeof(int), &block_t);
+        MPI_Type_commit(&block_t);
+
+        MPI_Type_free(&full_size_block_t);
+    }
+
+    MPI_Datatype displaced_block_t;
+    MPI_Type_vector(subdom_height, subdom_width, subdom_width + 2, MPI_INT, &displaced_block_t);
+    MPI_Type_commit(&displaced_block_t);
+    
+    Grid subdom(subdom_height, subdom_width + 2);
     Grid global;
 
     if (rank == 0)
@@ -236,14 +234,8 @@ int main(int argc, char **argv)
         print_grid(global);
     }
 
-    scatter_grid(global, subdom);
-
-    MPI_Datatype row_t;
-
-    MPI_Type_contiguous(subdom_width, MPI_INT, &row_t);
-    MPI_Type_commit(&row_t);
-    
-    sync_borders(subdom, row_t);
+    scatter_grid(global, subdom, block_t, displaced_block_t);
+    sync_borders(subdom, col_t);
     test_stop(subdom); // save gen 0 position
 
     // print_grid(subdom);
@@ -252,25 +244,25 @@ int main(int argc, char **argv)
     for (; gen < kMaxGenerations; ++gen)
     {
         Grid new_subdom = subdom;
-        for (int i = 1; i < subdom.rows() - 1; ++i)
+        for (int i = 0; i < subdom.rows(); ++i)
         {
-            for (int j = 0; j < subdom.cols(); ++j)
+            for (int j = 1; j < subdom.cols() - 1; ++j)
             {
-                int prev_j = j == 0 ? subdom.cols() - 1 : j - 1;
-                int next_j = j == subdom.cols() - 1 ? 0 : j + 1;
+                int prev_i = i == 0 ? subdom.rows() - 1 : i - 1;
+                int next_i = i == subdom.rows() - 1 ? 0 : i + 1;
                 
                 int neighbors_count =
-                subdom[i - 1][prev_j] + subdom[i - 1][j] + subdom[i - 1][next_j] +
-                    subdom[i]    [prev_j] + subdom[i][next_j] +
-                    subdom[i + 1][prev_j] + subdom[i + 1][j] + subdom[i + 1][next_j];
+                    subdom[prev_i][j - 1] + subdom[prev_i][j] + subdom[prev_i][j + 1] +
+                    subdom[i]     [j - 1] + subdom[i][j + 1] +
+                    subdom[next_i][j - 1] + subdom[next_i][j] + subdom[next_i][j + 1];
                 
                     new_subdom[i][j] = (neighbors_count == 3) || 
-                    (subdom[i][j] && neighbors_count == 2);
+                                       (subdom[i][j] && neighbors_count == 2);
                 }
         }
 
         subdom = std::move(new_subdom);
-        sync_borders(subdom, row_t);
+        sync_borders(subdom, col_t);
 
         if (test_stop(subdom))
         {
@@ -278,7 +270,7 @@ int main(int argc, char **argv)
         }
     }
 
-    gather_grid(global, subdom);
+    gather_grid(global, subdom, block_t, displaced_block_t);
     if (rank == 0)
     {
         if (gen == kMaxGenerations)
@@ -293,7 +285,11 @@ int main(int argc, char **argv)
         print_grid(global);
     }
     
-    MPI_Type_free(&row_t);
+    MPI_Type_free(&col_t);
+    MPI_Type_free(&block_t);
+    MPI_Type_free(&displaced_block_t);
+
     MPI_Finalize();
+    
     return 0;
 }
