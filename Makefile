@@ -7,5 +7,8 @@ $(bin)/main: main.cpp
 run: $(bin)/main
 	mpirun -n 4 ./$(bin)/main
 
+run16: $(bin)/main
+	mpirun -n 16 ./$(bin)/main
+
 clean:
 	rm -fr $(bin)
